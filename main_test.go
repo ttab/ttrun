@@ -315,6 +315,54 @@ func TestHasPassRefs(t *testing.T) {
 	}
 }
 
+func TestShellQuote(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "simple value",
+			input: "hello",
+			want:  "'hello'",
+		},
+		{
+			name:  "value with spaces",
+			input: "hello world",
+			want:  "'hello world'",
+		},
+		{
+			name:  "value with single quotes",
+			input: "it's here",
+			want:  "'it'\\''s here'",
+		},
+		{
+			name:  "value with double quotes",
+			input: `say "hi"`,
+			want:  `'say "hi"'`,
+		},
+		{
+			name:  "empty value",
+			input: "",
+			want:  "''",
+		},
+		{
+			name:  "value with special chars",
+			input: "a$b`c\\d",
+			want:  "'a$b`c\\d'",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shellQuote(tt.input)
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestInterpolate(t *testing.T) {
 	mockResolve := func(path string) (string, error) {
 		return "SECRET(" + path + ")", nil

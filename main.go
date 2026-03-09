@@ -85,6 +85,10 @@ func run() error {
 		return runConfigure(os.Args[2:])
 	}
 
+	if len(os.Args) >= 2 && os.Args[1] == "direnv" {
+		return runDirenv(os.Args[2:])
+	}
+
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
@@ -152,6 +156,68 @@ func runConfigure(args []string) error {
 	}
 
 	return saveConfig(cfg)
+}
+
+func runDirenv(args []string) error {
+	if len(args) > 0 && args[0] == "hook" {
+		return runDirenvHook()
+	}
+
+	envFile := "ttrun.env"
+
+	if len(args) == 1 {
+		envFile = args[0]
+	} else if len(args) > 1 {
+		return errors.New("usage: ttrun direnv [envfile]")
+	}
+
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+
+	entries, err := parseEnvFile(envFile)
+	if err != nil {
+		return err
+	}
+
+	dir := storeDir()
+
+	if hasPassRefs(entries) {
+		err = ensureStore(dir)
+		if err != nil {
+			return err
+		}
+	}
+
+	resolver := newResolver(dir, cfg)
+
+	resolved, err := resolveSecrets(entries, resolver)
+	if err != nil {
+		return err
+	}
+
+	for _, env := range resolved {
+		key, value, _ := strings.Cut(env, "=")
+
+		fmt.Printf("export %s=%s\n", key, shellQuote(value))
+	}
+
+	return nil
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
+func runDirenvHook() error {
+	fmt.Print(`use_ttrun() {
+  watch_file "${1:-ttrun.env}"
+  eval "$(ttrun direnv "$@")"
+}
+`)
+
+	return nil
 }
 
 func hasPassRefs(entries []envEntry) bool {

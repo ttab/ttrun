@@ -19,6 +19,8 @@ For local pass secrets, `gpg` and `pass` must be installed. For Vault secrets, t
 ttrun [envfile] -- command [args...]
 ttrun set <secret-path>
 ttrun configure <key> <value>
+ttrun direnv [envfile]
+ttrun direnv hook
 ```
 
 If no env file is specified, `ttrun` reads `ttrun.env` in the current directory.
@@ -99,6 +101,41 @@ The first time ttrun encounters a pass secret reference, it initialises its pass
 4. If you have no keys, offer to generate one (with a passphrase you choose)
 
 After that, the store is ready and you won't be prompted again.
+
+### direnv integration
+
+ttrun can be used as a [direnv](https://direnv.net/) extension, so that your environment variables (with resolved secrets) are automatically loaded when you `cd` into a project directory.
+
+#### 1. Install the hook
+
+Run this once to add the `use_ttrun` function to direnv's library:
+
+```
+mkdir -p ~/.config/direnv/lib
+ttrun direnv hook > ~/.config/direnv/lib/ttrun.sh
+```
+
+#### 2. Add `use ttrun` to your `.envrc`
+
+In any project directory that has a `ttrun.env` file:
+
+```
+echo "use ttrun" >> .envrc
+direnv allow
+```
+
+To use a different env file:
+
+```
+echo 'use ttrun myapp.env' >> .envrc
+direnv allow
+```
+
+#### 3. That's it
+
+direnv will now resolve your secrets and export the environment variables whenever you enter the directory. It automatically re-evaluates when the env file changes.
+
+**Note:** pass secrets that don't exist yet will cause `ttrun direnv` to fail, since direnv runs non-interactively and can't prompt for input. Make sure all pass secrets are populated first (using `ttrun set` or by running `ttrun` directly once).
 
 ### How it works
 
