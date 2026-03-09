@@ -135,7 +135,7 @@ direnv allow
 
 direnv will now resolve your secrets and export the environment variables whenever you enter the directory. It automatically re-evaluates when the env file changes.
 
-**Note:** pass secrets that don't exist yet will cause `ttrun direnv` to fail, since direnv runs non-interactively and can't prompt for input. Make sure all pass secrets are populated first (using `ttrun set` or by running `ttrun` directly once).
+**Note:** Since direnv runs non-interactively, `ttrun direnv` cannot prompt for missing secrets. Any variable whose secrets can't be resolved is skipped, and a message is logged to stderr. Populate missing pass secrets with `ttrun set` or by running `ttrun` directly once.
 
 ### How it works
 

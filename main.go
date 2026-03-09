@@ -191,16 +191,17 @@ func runDirenv(args []string) error {
 	}
 
 	resolver := newResolver(dir, cfg)
+	resolver.nonInteractive = true
 
-	resolved, err := resolveSecrets(entries, resolver)
-	if err != nil {
-		return err
-	}
+	for _, e := range entries {
+		resolved, err := interpolate(e.value, resolver.resolve)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ttrun direnv: skipping %s: %v\n", e.key, err)
 
-	for _, env := range resolved {
-		key, value, _ := strings.Cut(env, "=")
+			continue
+		}
 
-		fmt.Printf("export %s=%s\n", key, shellQuote(value))
+		fmt.Printf("export %s=%s\n", e.key, shellQuote(resolved))
 	}
 
 	return nil
@@ -368,9 +369,10 @@ func interpolate(value string, resolve func(string) (string, error)) (string, er
 }
 
 type resolver struct {
-	passDir    string
-	cfg        config
-	vaultCache map[string]map[string]string
+	passDir        string
+	cfg            config
+	vaultCache     map[string]map[string]string
+	nonInteractive bool
 }
 
 func newResolver(passDir string, cfg config) *resolver {
@@ -384,6 +386,15 @@ func newResolver(passDir string, cfg config) *resolver {
 func (r *resolver) resolve(ref string) (string, error) {
 	if strings.HasPrefix(ref, "vault://") {
 		return r.resolveVault(ref)
+	}
+
+	if r.nonInteractive {
+		secret, err := passShow(r.passDir, ref)
+		if err != nil {
+			return "", fmt.Errorf("secret %q not found in store", ref)
+		}
+
+		return secret, nil
 	}
 
 	return getOrCreateSecret(ref, r.passDir)
