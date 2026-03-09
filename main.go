@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -754,11 +755,15 @@ func setSecret(path, storeDir string) error {
 func passInsert(storeDir, path, value string) error {
 	cmd := passCmd(storeDir, "insert", "--multiline", "--force", path)
 	cmd.Stdin = strings.NewReader(value + "\n")
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
+
+	var stderr bytes.Buffer
+
+	cmd.Stderr = &stderr
 
 	err := cmd.Run()
 	if err != nil {
+		_, _ = os.Stderr.Write(stderr.Bytes())
+
 		return fmt.Errorf("insert secret %q: %w", path, err)
 	}
 
