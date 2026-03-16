@@ -6,6 +6,64 @@ import (
 	"testing"
 )
 
+func TestWantHelp(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{
+			name: "no args",
+			args: []string{},
+			want: false,
+		},
+		{
+			name: "-h first",
+			args: []string{"-h"},
+			want: true,
+		},
+		{
+			name: "--help first",
+			args: []string{"--help"},
+			want: true,
+		},
+		{
+			name: "-h after subcommand",
+			args: []string{"set", "-h"},
+			want: true,
+		},
+		{
+			name: "--help with envfile",
+			args: []string{"custom.env", "--help"},
+			want: true,
+		},
+		{
+			name: "-h after separator ignored",
+			args: []string{"--", "-h"},
+			want: false,
+		},
+		{
+			name: "--help after separator ignored",
+			args: []string{"custom.env", "--", "--help"},
+			want: false,
+		},
+		{
+			name: "no help flag",
+			args: []string{"--", "echo", "hello"},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := wantHelp(tt.args)
+			if got != tt.want {
+				t.Errorf("wantHelp(%v) = %v, want %v", tt.args, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseArgs(t *testing.T) {
 	tests := []struct {
 		name    string

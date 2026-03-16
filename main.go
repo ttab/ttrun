@@ -77,7 +77,52 @@ func storeDir() string {
 	return filepath.Join(os.Getenv("HOME"), ".local", "share", "ttrun", "password-store")
 }
 
+const usageText = `ttrun - run commands with secrets from pass and Vault
+
+Usage:
+  ttrun [envfile] -- command [args...]
+  ttrun set <secret-path>
+  ttrun configure <key> <value>
+  ttrun direnv [envfile]
+  ttrun direnv hook
+
+Options:
+  -h, --help    Show this help message
+
+The env file (default: ttrun.env) contains KEY=VALUE lines where values
+may reference secrets using {{path/to/secret}} for pass or
+{{vault://mount/path.field}} for Vault.
+
+Commands:
+  set          Interactively store a secret in the local pass store
+  configure    Set a configuration value (e.g. default-vault-addr)
+  direnv       Print export statements for use with direnv
+  direnv hook  Print a direnv hook that enables use_ttrun
+
+Configuration keys:
+  default-vault-addr   Default Vault server address (used when VAULT_ADDR is not set)
+`
+
+func wantHelp(args []string) bool {
+	for _, arg := range args {
+		if arg == "--" {
+			return false
+		}
+
+		if arg == "-h" || arg == "--help" {
+			return true
+		}
+	}
+
+	return false
+}
+
 func run() error {
+	if wantHelp(os.Args[1:]) {
+		fmt.Print(usageText)
+		return nil
+	}
+
 	if len(os.Args) >= 2 && os.Args[1] == "set" {
 		return runSet(os.Args[2:])
 	}
