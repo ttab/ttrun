@@ -532,3 +532,126 @@ func TestInterpolate(t *testing.T) {
 		})
 	}
 }
+
+func TestVaultCachePath(t *testing.T) {
+	tests := []struct {
+		name    string
+		addr    string
+		ref     string
+		want    string
+		wantErr bool
+	}{
+		{
+			name: "standard https",
+			addr: "https://vault.example.com",
+			ref:  "vault://secret/myapp/creds.password",
+			want: "__cache/vault/vault.example.com/secret/myapp/creds.password",
+		},
+		{
+			name: "with port",
+			addr: "https://vault.example.com:8200",
+			ref:  "vault://mount/path.field",
+			want: "__cache/vault/vault.example.com:8200/mount/path.field",
+		},
+		{
+			name: "http address",
+			addr: "http://localhost:8200",
+			ref:  "vault://kv/data.key",
+			want: "__cache/vault/localhost:8200/kv/data.key",
+		},
+		{
+			name:    "invalid addr",
+			addr:    "://bad",
+			ref:     "vault://mount/path.field",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := vaultCachePath(tt.addr, tt.ref)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCollectVaultRefs(t *testing.T) {
+	tests := []struct {
+		name    string
+		entries []envEntry
+		want    []string
+	}{
+		{
+			name:    "no refs",
+			entries: []envEntry{{key: "A", value: "plain"}},
+			want:    nil,
+		},
+		{
+			name:    "pass ref only",
+			entries: []envEntry{{key: "A", value: "{{secret/path}}"}},
+			want:    nil,
+		},
+		{
+			name: "single vault ref",
+			entries: []envEntry{
+				{key: "A", value: "{{vault://mount/path.field}}"},
+			},
+			want: []string{"vault://mount/path.field"},
+		},
+		{
+			name: "multiple unique refs",
+			entries: []envEntry{
+				{key: "A", value: "{{vault://m/p.f1}}"},
+				{key: "B", value: "{{vault://m/p.f2}}"},
+			},
+			want: []string{"vault://m/p.f1", "vault://m/p.f2"},
+		},
+		{
+			name: "deduplicates",
+			entries: []envEntry{
+				{key: "A", value: "{{vault://m/p.f}}"},
+				{key: "B", value: "{{vault://m/p.f}}"},
+			},
+			want: []string{"vault://m/p.f"},
+		},
+		{
+			name: "mixed refs",
+			entries: []envEntry{
+				{key: "A", value: "{{secret/pass}}"},
+				{key: "B", value: "{{vault://m/p.f}}"},
+				{key: "C", value: "prefix-{{vault://m2/p2.f2}}-suffix"},
+			},
+			want: []string{"vault://m/p.f", "vault://m2/p2.f2"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := collectVaultRefs(tt.entries)
+
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %v, want %v", got, tt.want)
+			}
+
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("ref[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}

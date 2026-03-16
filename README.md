@@ -20,6 +20,7 @@ ttrun [envfile] -- command [args...]
 ttrun set <secret-path>
 ttrun get <secret-path>
 ttrun ls [subfolder]
+ttrun pull [envfile]
 ttrun configure <key> <value>
 ttrun direnv [envfile]
 ttrun direnv hook
@@ -87,6 +88,30 @@ ttrun configure default-vault-addr https://vault.example.com
 Available configuration keys:
 
 - `default-vault-addr` -- Vault server address to use when `VAULT_ADDR` is not set
+- `cache` -- enable persistent caching of vault secrets in the local pass store (`true`/`false`, default `false`)
+
+### Vault caching
+
+Vault lookups require network access and authentication. You can enable persistent caching to resolve vault secrets offline after an initial fetch:
+
+```
+ttrun configure cache true
+```
+
+When caching is enabled, resolved vault secrets are stored in the local pass store under `__cache/vault/<host>/...`. On subsequent runs, cached values are used without contacting Vault.
+
+#### Pre-populating the cache
+
+The `pull` command fetches and caches all vault secrets referenced in the env file in one go:
+
+```
+ttrun pull
+ttrun pull myapp.env
+```
+
+This is useful for going offline or for populating a fresh machine. It fetches each unique vault path once and caches all fields returned, so even fields not yet referenced in the env file are available.
+
+**Note:** `pull` always fetches from Vault regardless of what's already cached, so it can also be used to refresh stale cache entries.
 
 ### Updating secrets
 

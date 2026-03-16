@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -18,6 +19,7 @@ import (
 
 type config struct {
 	DefaultVaultAddr string `json:"default_vault_addr,omitempty"`
+	Cache            bool   `json:"cache,omitempty"`
 }
 
 func configPath() string {
@@ -89,6 +91,7 @@ Usage:
   ttrun set <secret-path>
   ttrun get <secret-path>
   ttrun ls [subfolder]
+  ttrun pull [envfile]
   ttrun configure <key> <value>
   ttrun direnv [envfile]
   ttrun direnv hook
@@ -105,12 +108,14 @@ Commands:
   set          Interactively store a secret in the local pass store
   get          Print a secret from the local pass store
   ls           List secrets in the local pass store
+  pull         Pre-fetch and cache all vault secrets from the env file
   configure    Set a configuration value (e.g. default-vault-addr)
   direnv       Print export statements for use with direnv
   direnv hook  Print a direnv hook that enables use_ttrun
 
 Configuration keys:
   default-vault-addr   Default Vault server address (used when VAULT_ADDR is not set)
+  cache                Enable persistent caching of vault secrets (true/false)
 `
 
 // parseFlags extracts global flags (-h, --help, -v, --verbose) from args
@@ -195,6 +200,10 @@ func run() error {
 		return runGet(args[1:], f.Verbose)
 	}
 
+	if len(args) >= 1 && args[0] == "pull" {
+		return runPull(args[1:], f.Verbose)
+	}
+
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
@@ -212,7 +221,8 @@ func run() error {
 
 	dir := storeDir()
 
-	if hasPassRefs(entries) {
+	needsStore := hasPassRefs(entries) || (cfg.Cache && len(collectVaultRefs(entries)) > 0)
+	if needsStore {
 		err = ensureStore(dir, f.Verbose)
 		if err != nil {
 			return err
@@ -257,6 +267,15 @@ func runConfigure(args []string) error {
 	switch args[0] {
 	case "default-vault-addr":
 		cfg.DefaultVaultAddr = args[1]
+	case "cache":
+		switch args[1] {
+		case "true":
+			cfg.Cache = true
+		case "false":
+			cfg.Cache = false
+		default:
+			return fmt.Errorf("cache value must be %q or %q, got %q", "true", "false", args[1])
+		}
 	default:
 		return fmt.Errorf("unknown configuration key: %q", args[0])
 	}
@@ -593,21 +612,45 @@ func (r *resolver) vaultAddr() (string, error) {
 		"  Or configure a default: ttrun configure default-vault-addr https://your-vault.server")
 }
 
+func vaultCachePath(addr, ref string) (string, error) {
+	u, err := url.Parse(addr)
+	if err != nil {
+		return "", fmt.Errorf("parse vault address: %w", err)
+	}
+
+	trimmed := strings.TrimPrefix(ref, "vault://")
+
+	return "__cache/vault/" + u.Host + "/" + trimmed, nil
+}
+
 func (r *resolver) resolveVault(ref string) (string, error) {
 	v, err := parseVaultRef(ref)
 	if err != nil {
 		return "", err
 	}
 
-	cacheKey := v.mount + "/" + v.path
+	addr, err := r.vaultAddr()
+	if err != nil {
+		return "", err
+	}
 
-	fields, ok := r.vaultCache[cacheKey]
-	if !ok {
-		addr, err := r.vaultAddr()
+	// Check persistent pass cache before in-memory cache
+	if r.cfg.Cache {
+		cp, err := vaultCachePath(addr, ref)
 		if err != nil {
 			return "", err
 		}
 
+		cached, err := passShow(r.passDir, cp, r.verbose)
+		if err == nil {
+			return cached, nil
+		}
+	}
+
+	cacheKey := v.mount + "/" + v.path
+
+	fields, ok := r.vaultCache[cacheKey]
+	if !ok {
 		fields, err = vaultGet(v.mount, v.path, addr, r.verbose)
 		if err != nil {
 			return "", err
@@ -616,12 +659,151 @@ func (r *resolver) resolveVault(ref string) (string, error) {
 		r.vaultCache[cacheKey] = fields
 	}
 
+	// Persist all fields to pass cache
+	if r.cfg.Cache {
+		for fieldName, fieldVal := range fields {
+			cp, err := vaultCachePath(addr, "vault://"+v.mount+"/"+v.path+"."+fieldName)
+			if err != nil {
+				return "", err
+			}
+
+			err = passInsert(r.passDir, cp, fieldVal, r.verbose)
+			if err != nil {
+				return "", fmt.Errorf("cache vault secret: %w", err)
+			}
+		}
+	}
+
 	value, ok := fields[v.field]
 	if !ok {
 		return "", fmt.Errorf("vault secret %s/%s has no field %q", v.mount, v.path, v.field)
 	}
 
 	return value, nil
+}
+
+func collectVaultRefs(entries []envEntry) []string {
+	seen := make(map[string]struct{})
+	var refs []string
+
+	for _, e := range entries {
+		rest := e.value
+
+		for {
+			i := strings.Index(rest, "{{")
+			if i == -1 {
+				break
+			}
+
+			rest = rest[i+2:]
+
+			j := strings.Index(rest, "}}")
+			if j == -1 {
+				break
+			}
+
+			ref := rest[:j]
+			rest = rest[j+2:]
+
+			if !strings.HasPrefix(ref, "vault://") {
+				continue
+			}
+
+			if _, ok := seen[ref]; ok {
+				continue
+			}
+
+			seen[ref] = struct{}{}
+			refs = append(refs, ref)
+		}
+	}
+
+	return refs
+}
+
+func runPull(args []string, verbose bool) error {
+	envFile := "ttrun.env"
+
+	if len(args) == 1 {
+		envFile = args[0]
+	} else if len(args) > 1 {
+		return errors.New("usage: ttrun pull [envfile]")
+	}
+
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+
+	entries, err := parseEnvFile(envFile)
+	if err != nil {
+		return err
+	}
+
+	refs := collectVaultRefs(entries)
+	if len(refs) == 0 {
+		fmt.Fprintln(os.Stderr, "no vault references found")
+		return nil
+	}
+
+	dir := storeDir()
+
+	err = ensureStore(dir, verbose)
+	if err != nil {
+		return err
+	}
+
+	r := newResolver(dir, cfg, verbose)
+
+	addr, err := r.vaultAddr()
+	if err != nil {
+		return err
+	}
+
+	// Group refs by mount/path to avoid duplicate vault calls
+	type pathKey struct {
+		mount string
+		path  string
+	}
+
+	groups := make(map[pathKey][]vaultRef)
+
+	for _, ref := range refs {
+		v, err := parseVaultRef(ref)
+		if err != nil {
+			return err
+		}
+
+		pk := pathKey{mount: v.mount, path: v.path}
+		groups[pk] = append(groups[pk], v)
+	}
+
+	var totalFields int
+
+	for pk := range groups {
+		fields, err := vaultGet(pk.mount, pk.path, addr, verbose)
+		if err != nil {
+			return err
+		}
+
+		for fieldName, fieldVal := range fields {
+			cp, err := vaultCachePath(addr, "vault://"+pk.mount+"/"+pk.path+"."+fieldName)
+			if err != nil {
+				return err
+			}
+
+			err = passInsert(dir, cp, fieldVal, verbose)
+			if err != nil {
+				return fmt.Errorf("cache vault secret: %w", err)
+			}
+
+			totalFields++
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "cached %d fields from %d vault paths\n", totalFields, len(groups))
+
+	return nil
 }
 
 func vaultGet(mount, path, addr string, verbose bool) (map[string]string, error) {
