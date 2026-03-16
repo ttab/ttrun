@@ -6,59 +6,101 @@ import (
 	"testing"
 )
 
-func TestWantHelp(t *testing.T) {
+func TestParseFlags(t *testing.T) {
 	tests := []struct {
-		name string
-		args []string
-		want bool
+		name        string
+		args        []string
+		wantArgs    []string
+		wantHelp    bool
+		wantVerbose bool
 	}{
+		{
+			name:     "no flags",
+			args:     []string{"--", "echo"},
+			wantArgs: []string{"--", "echo"},
+		},
+		{
+			name:        "-v before separator",
+			args:        []string{"-v", "--", "echo"},
+			wantArgs:    []string{"--", "echo"},
+			wantVerbose: true,
+		},
+		{
+			name:        "--verbose before separator",
+			args:        []string{"--verbose", "--", "echo"},
+			wantArgs:    []string{"--", "echo"},
+			wantVerbose: true,
+		},
+		{
+			name:     "-v after separator kept",
+			args:     []string{"--", "cmd", "-v"},
+			wantArgs: []string{"--", "cmd", "-v"},
+		},
+		{
+			name:        "-v with subcommand",
+			args:        []string{"-v", "set", "secret/path"},
+			wantArgs:    []string{"set", "secret/path"},
+			wantVerbose: true,
+		},
+		{
+			name:        "-v after envfile",
+			args:        []string{"custom.env", "-v", "--", "echo"},
+			wantArgs:    []string{"custom.env", "--", "echo"},
+			wantVerbose: true,
+		},
+		{
+			name:     "-h",
+			args:     []string{"-h"},
+			wantHelp: true,
+		},
+		{
+			name:     "--help",
+			args:     []string{"--help"},
+			wantHelp: true,
+		},
+		{
+			name:     "-h after subcommand",
+			args:     []string{"set", "-h"},
+			wantArgs: []string{"set"},
+			wantHelp: true,
+		},
+		{
+			name:     "--help after separator ignored",
+			args:     []string{"custom.env", "--", "--help"},
+			wantArgs: []string{"custom.env", "--", "--help"},
+		},
+		{
+			name:        "combined flags",
+			args:        []string{"-v", "--help"},
+			wantHelp:    true,
+			wantVerbose: true,
+		},
 		{
 			name: "no args",
 			args: []string{},
-			want: false,
-		},
-		{
-			name: "-h first",
-			args: []string{"-h"},
-			want: true,
-		},
-		{
-			name: "--help first",
-			args: []string{"--help"},
-			want: true,
-		},
-		{
-			name: "-h after subcommand",
-			args: []string{"set", "-h"},
-			want: true,
-		},
-		{
-			name: "--help with envfile",
-			args: []string{"custom.env", "--help"},
-			want: true,
-		},
-		{
-			name: "-h after separator ignored",
-			args: []string{"--", "-h"},
-			want: false,
-		},
-		{
-			name: "--help after separator ignored",
-			args: []string{"custom.env", "--", "--help"},
-			want: false,
-		},
-		{
-			name: "no help flag",
-			args: []string{"--", "echo", "hello"},
-			want: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := wantHelp(tt.args)
-			if got != tt.want {
-				t.Errorf("wantHelp(%v) = %v, want %v", tt.args, got, tt.want)
+			f, got := parseFlags(tt.args)
+
+			if f.Help != tt.wantHelp {
+				t.Errorf("Help = %v, want %v", f.Help, tt.wantHelp)
+			}
+
+			if f.Verbose != tt.wantVerbose {
+				t.Errorf("Verbose = %v, want %v", f.Verbose, tt.wantVerbose)
+			}
+
+			if len(got) != len(tt.wantArgs) {
+				t.Fatalf("args = %v, want %v", got, tt.wantArgs)
+			}
+
+			for i := range got {
+				if got[i] != tt.wantArgs[i] {
+					t.Errorf("args[%d] = %q, want %q", i, got[i], tt.wantArgs[i])
+				}
 			}
 		})
 	}
@@ -251,7 +293,7 @@ func TestVaultAddr(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv("VAULT_ADDR", tt.envAddr)
 
-			r := newResolver("", config{DefaultVaultAddr: tt.cfgAddr})
+			r := newResolver("", config{DefaultVaultAddr: tt.cfgAddr}, false)
 
 			got, err := r.vaultAddr()
 			if tt.wantErr {

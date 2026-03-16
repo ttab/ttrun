@@ -18,10 +18,17 @@ For local pass secrets, `gpg` and `pass` must be installed. For Vault secrets, t
 ```
 ttrun [envfile] -- command [args...]
 ttrun set <secret-path>
+ttrun get <secret-path>
+ttrun ls [subfolder]
 ttrun configure <key> <value>
 ttrun direnv [envfile]
 ttrun direnv hook
 ```
+
+Global options (can appear anywhere before `--`):
+
+- `-h`, `--help` -- show usage information
+- `-v`, `--verbose` -- print each subprocess command to stderr and show their stderr output
 
 If no env file is specified, `ttrun` reads `ttrun.env` in the current directory.
 
@@ -90,6 +97,23 @@ ttrun set client_secrets/testing
 ```
 
 This prompts for the value (with confirmation) and stores it. Use this to rotate secrets without having to delete and re-run.
+
+### Listing secrets
+
+To list secrets in the local pass store:
+
+```
+ttrun ls
+ttrun ls external
+```
+
+### Reading secrets
+
+To print a secret from the local pass store:
+
+```
+ttrun get external/gemini_api_key
+```
 
 ### First run
 

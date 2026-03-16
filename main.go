@@ -77,17 +77,25 @@ func storeDir() string {
 	return filepath.Join(os.Getenv("HOME"), ".local", "share", "ttrun", "password-store")
 }
 
+type flags struct {
+	Help    bool
+	Verbose bool
+}
+
 const usageText = `ttrun - run commands with secrets from pass and Vault
 
 Usage:
   ttrun [envfile] -- command [args...]
   ttrun set <secret-path>
+  ttrun get <secret-path>
+  ttrun ls [subfolder]
   ttrun configure <key> <value>
   ttrun direnv [envfile]
   ttrun direnv hook
 
 Options:
-  -h, --help    Show this help message
+  -h, --help       Show this help message
+  -v, --verbose    Print subprocess commands and show their stderr
 
 The env file (default: ttrun.env) contains KEY=VALUE lines where values
 may reference secrets using {{path/to/secret}} for pass or
@@ -95,6 +103,8 @@ may reference secrets using {{path/to/secret}} for pass or
 
 Commands:
   set          Interactively store a secret in the local pass store
+  get          Print a secret from the local pass store
+  ls           List secrets in the local pass store
   configure    Set a configuration value (e.g. default-vault-addr)
   direnv       Print export statements for use with direnv
   direnv hook  Print a direnv hook that enables use_ttrun
@@ -103,36 +113,86 @@ Configuration keys:
   default-vault-addr   Default Vault server address (used when VAULT_ADDR is not set)
 `
 
-func wantHelp(args []string) bool {
+// parseFlags extracts global flags (-h, --help, -v, --verbose) from args
+// before the -- separator and returns the parsed flags and remaining args.
+func parseFlags(args []string) (flags, []string) {
+	var f flags
+
+	var filtered []string
+
+	pastSep := false
+
 	for _, arg := range args {
 		if arg == "--" {
-			return false
+			pastSep = true
+			filtered = append(filtered, arg)
+
+			continue
 		}
 
-		if arg == "-h" || arg == "--help" {
-			return true
+		if !pastSep {
+			switch arg {
+			case "-h", "--help":
+				f.Help = true
+
+				continue
+			case "-v", "--verbose":
+				f.Verbose = true
+
+				continue
+			}
 		}
+
+		filtered = append(filtered, arg)
 	}
 
-	return false
+	return f, filtered
+}
+
+func logCmd(cmd *exec.Cmd, verbose bool, extraEnv []string) {
+	if !verbose {
+		return
+	}
+
+	parts := append(extraEnv, cmd.Args...)
+	fmt.Fprintf(os.Stderr, "+ %s\n", strings.Join(parts, " "))
+
+	if cmd.Stderr == nil {
+		cmd.Stderr = os.Stderr
+	}
+}
+
+func setupCmdEnv(cmd *exec.Cmd, verbose bool, extraEnv []string) {
+	cmd.Env = append(os.Environ(), extraEnv...)
+	logCmd(cmd, verbose, extraEnv)
 }
 
 func run() error {
-	if wantHelp(os.Args[1:]) {
+	f, args := parseFlags(os.Args[1:])
+
+	if f.Help {
 		fmt.Print(usageText)
 		return nil
 	}
 
-	if len(os.Args) >= 2 && os.Args[1] == "set" {
-		return runSet(os.Args[2:])
+	if len(args) >= 1 && args[0] == "set" {
+		return runSet(args[1:], f.Verbose)
 	}
 
-	if len(os.Args) >= 2 && os.Args[1] == "configure" {
-		return runConfigure(os.Args[2:])
+	if len(args) >= 1 && args[0] == "configure" {
+		return runConfigure(args[1:])
 	}
 
-	if len(os.Args) >= 2 && os.Args[1] == "direnv" {
-		return runDirenv(os.Args[2:])
+	if len(args) >= 1 && args[0] == "direnv" {
+		return runDirenv(args[1:], f.Verbose)
+	}
+
+	if len(args) >= 1 && args[0] == "ls" {
+		return runLs(args[1:], f.Verbose)
+	}
+
+	if len(args) >= 1 && args[0] == "get" {
+		return runGet(args[1:], f.Verbose)
 	}
 
 	cfg, err := loadConfig()
@@ -140,7 +200,7 @@ func run() error {
 		return err
 	}
 
-	envFile, cmdArgs, err := parseArgs(os.Args[1:])
+	envFile, cmdArgs, err := parseArgs(args)
 	if err != nil {
 		return err
 	}
@@ -153,35 +213,35 @@ func run() error {
 	dir := storeDir()
 
 	if hasPassRefs(entries) {
-		err = ensureStore(dir)
+		err = ensureStore(dir, f.Verbose)
 		if err != nil {
 			return err
 		}
 	}
 
-	resolver := newResolver(dir, cfg)
+	resolver := newResolver(dir, cfg, f.Verbose)
 
 	resolved, err := resolveSecrets(entries, resolver)
 	if err != nil {
 		return err
 	}
 
-	return execCommand(cmdArgs, resolved)
+	return execCommand(cmdArgs, resolved, f.Verbose)
 }
 
-func runSet(args []string) error {
+func runSet(args []string, verbose bool) error {
 	if len(args) != 1 {
 		return errors.New("usage: ttrun set <secret-path>")
 	}
 
 	dir := storeDir()
 
-	err := ensureStore(dir)
+	err := ensureStore(dir, verbose)
 	if err != nil {
 		return err
 	}
 
-	return setSecret(args[0], dir)
+	return setSecret(args[0], dir, verbose)
 }
 
 func runConfigure(args []string) error {
@@ -204,7 +264,48 @@ func runConfigure(args []string) error {
 	return saveConfig(cfg)
 }
 
-func runDirenv(args []string) error {
+func runLs(args []string, verbose bool) error {
+	if len(args) > 1 {
+		return errors.New("usage: ttrun ls [subfolder]")
+	}
+
+	dir := storeDir()
+
+	passArgs := []string{"ls"}
+	if len(args) == 1 {
+		passArgs = append(passArgs, args[0])
+	}
+
+	cmd := passCmd(dir, verbose, passArgs...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	err := cmd.Run()
+	if err != nil {
+		return fmt.Errorf("list secrets: %w", err)
+	}
+
+	return nil
+}
+
+func runGet(args []string, verbose bool) error {
+	if len(args) != 1 {
+		return errors.New("usage: ttrun get <secret-path>")
+	}
+
+	dir := storeDir()
+
+	secret, err := passShow(dir, args[0], verbose)
+	if err != nil {
+		return fmt.Errorf("get secret %q: %w", args[0], err)
+	}
+
+	fmt.Println(secret)
+
+	return nil
+}
+
+func runDirenv(args []string, verbose bool) error {
 	if len(args) > 0 && args[0] == "hook" {
 		return runDirenvHook()
 	}
@@ -230,13 +331,13 @@ func runDirenv(args []string) error {
 	dir := storeDir()
 
 	if hasPassRefs(entries) {
-		err = ensureStore(dir)
+		err = ensureStore(dir, verbose)
 		if err != nil {
 			return err
 		}
 	}
 
-	resolver := newResolver(dir, cfg)
+	resolver := newResolver(dir, cfg, verbose)
 	resolver.nonInteractive = true
 
 	for _, e := range entries {
@@ -419,13 +520,15 @@ type resolver struct {
 	cfg            config
 	vaultCache     map[string]map[string]string
 	nonInteractive bool
+	verbose        bool
 }
 
-func newResolver(passDir string, cfg config) *resolver {
+func newResolver(passDir string, cfg config, verbose bool) *resolver {
 	return &resolver{
 		passDir:    passDir,
 		cfg:        cfg,
 		vaultCache: make(map[string]map[string]string),
+		verbose:    verbose,
 	}
 }
 
@@ -435,7 +538,7 @@ func (r *resolver) resolve(ref string) (string, error) {
 	}
 
 	if r.nonInteractive {
-		secret, err := passShow(r.passDir, ref)
+		secret, err := passShow(r.passDir, ref, r.verbose)
 		if err != nil {
 			return "", fmt.Errorf("secret %q not found in store", ref)
 		}
@@ -443,7 +546,7 @@ func (r *resolver) resolve(ref string) (string, error) {
 		return secret, nil
 	}
 
-	return getOrCreateSecret(ref, r.passDir)
+	return getOrCreateSecret(ref, r.passDir, r.verbose)
 }
 
 type vaultRef struct {
@@ -505,7 +608,7 @@ func (r *resolver) resolveVault(ref string) (string, error) {
 			return "", err
 		}
 
-		fields, err = vaultGet(v.mount, v.path, addr)
+		fields, err = vaultGet(v.mount, v.path, addr, r.verbose)
 		if err != nil {
 			return "", err
 		}
@@ -521,11 +624,12 @@ func (r *resolver) resolveVault(ref string) (string, error) {
 	return value, nil
 }
 
-func vaultGet(mount, path, addr string) (map[string]string, error) {
+func vaultGet(mount, path, addr string, verbose bool) (map[string]string, error) {
 	args := []string{"kv", "get", "-mount=" + mount, "-format=json", path}
 
 	cmd := exec.Command("vault", args...)
-	cmd.Env = append(os.Environ(), "VAULT_ADDR="+addr)
+
+	setupCmdEnv(cmd, verbose, []string{"VAULT_ADDR=" + addr})
 
 	out, err := cmd.Output()
 	if err != nil {
@@ -577,8 +681,10 @@ type gpgKey struct {
 	uid         string
 }
 
-func listSecretKeys() ([]gpgKey, error) {
+func listSecretKeys(verbose bool) ([]gpgKey, error) {
 	cmd := exec.Command("gpg", "--list-secret-keys", "--with-colons")
+
+	setupCmdEnv(cmd, verbose, nil)
 
 	out, err := cmd.Output()
 	if err != nil {
@@ -628,7 +734,7 @@ func readPassword(prompt string) (string, error) {
 	return string(pw), nil
 }
 
-func generateKey() (string, error) {
+func generateKey(verbose bool) (string, error) {
 	passphrase, err := readPassword("Enter passphrase for new GPG key: ")
 	if err != nil {
 		return "", err
@@ -652,12 +758,14 @@ func generateKey() (string, error) {
 	cmd.Stdin = strings.NewReader(passphrase)
 	cmd.Stderr = os.Stderr
 
+	logCmd(cmd, verbose, nil)
+
 	err = cmd.Run()
 	if err != nil {
 		return "", fmt.Errorf("generate GPG key: %w", err)
 	}
 
-	keys, err := listSecretKeys()
+	keys, err := listSecretKeys(verbose)
 	if err != nil {
 		return "", err
 	}
@@ -671,8 +779,8 @@ func generateKey() (string, error) {
 	return "", errors.New("could not find newly generated GPG key")
 }
 
-func promptKey() (string, error) {
-	keys, err := listSecretKeys()
+func promptKey(verbose bool) (string, error) {
+	keys, err := listSecretKeys(verbose)
 	if err != nil {
 		return "", err
 	}
@@ -691,7 +799,7 @@ func promptKey() (string, error) {
 			return "", errors.New("cannot initialise store without a GPG key")
 		}
 
-		return generateKey()
+		return generateKey(verbose)
 	}
 
 	if len(keys) == 1 {
@@ -749,7 +857,7 @@ func readLine() (string, error) {
 	return scanner.Text(), nil
 }
 
-func ensureStore(storeDir string) error {
+func ensureStore(storeDir string, verbose bool) error {
 	_, err := os.Stat(storeDir)
 	if err == nil {
 		return nil
@@ -761,12 +869,12 @@ func ensureStore(storeDir string) error {
 
 	fmt.Fprintf(os.Stderr, "ttrun: initialising password store at %s\n", storeDir)
 
-	gpgID, err := promptKey()
+	gpgID, err := promptKey(verbose)
 	if err != nil {
 		return err
 	}
 
-	cmd := passCmd(storeDir, "init", gpgID)
+	cmd := passCmd(storeDir, verbose, "init", gpgID)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
@@ -779,7 +887,7 @@ func ensureStore(storeDir string) error {
 	return nil
 }
 
-func setSecret(path, storeDir string) error {
+func setSecret(path, storeDir string, verbose bool) error {
 	value, err := readPassword(fmt.Sprintf("Enter secret for %s: ", path))
 	if err != nil {
 		return err
@@ -794,29 +902,38 @@ func setSecret(path, storeDir string) error {
 		return errors.New("secrets do not match")
 	}
 
-	return passInsert(storeDir, path, value)
+	return passInsert(storeDir, path, value, verbose)
 }
 
-func passInsert(storeDir, path, value string) error {
-	cmd := passCmd(storeDir, "insert", "--multiline", "--force", path)
+func passInsert(storeDir, path, value string, verbose bool) error {
+	cmd := passCmd(storeDir, verbose, "insert", "--multiline", "--force", path)
 	cmd.Stdin = strings.NewReader(value + "\n")
 
-	var stderr bytes.Buffer
+	if !verbose {
+		var stderr bytes.Buffer
 
-	cmd.Stderr = &stderr
+		cmd.Stderr = &stderr
+
+		err := cmd.Run()
+		if err != nil {
+			_, _ = os.Stderr.Write(stderr.Bytes())
+
+			return fmt.Errorf("insert secret %q: %w", path, err)
+		}
+
+		return nil
+	}
 
 	err := cmd.Run()
 	if err != nil {
-		_, _ = os.Stderr.Write(stderr.Bytes())
-
 		return fmt.Errorf("insert secret %q: %w", path, err)
 	}
 
 	return nil
 }
 
-func getOrCreateSecret(path, storeDir string) (string, error) {
-	secret, err := passShow(storeDir, path)
+func getOrCreateSecret(path, storeDir string, verbose bool) (string, error) {
+	secret, err := passShow(storeDir, path, verbose)
 	if err == nil {
 		return secret, nil
 	}
@@ -828,16 +945,16 @@ func getOrCreateSecret(path, storeDir string) (string, error) {
 		return "", err
 	}
 
-	err = passInsert(storeDir, path, value)
+	err = passInsert(storeDir, path, value, verbose)
 	if err != nil {
 		return "", err
 	}
 
-	return passShow(storeDir, path)
+	return passShow(storeDir, path, verbose)
 }
 
-func passShow(storeDir, path string) (string, error) {
-	cmd := passCmd(storeDir, "show", path)
+func passShow(storeDir, path string, verbose bool) (string, error) {
+	cmd := passCmd(storeDir, verbose, "show", path)
 
 	out, err := cmd.Output()
 	if err != nil {
@@ -847,19 +964,21 @@ func passShow(storeDir, path string) (string, error) {
 	return strings.TrimRight(string(out), "\n"), nil
 }
 
-func passCmd(storeDir string, args ...string) *exec.Cmd {
+func passCmd(storeDir string, verbose bool, args ...string) *exec.Cmd {
 	cmd := exec.Command("pass", args...)
-	cmd.Env = append(os.Environ(), "PASSWORD_STORE_DIR="+storeDir)
+
+	setupCmdEnv(cmd, verbose, []string{"PASSWORD_STORE_DIR=" + storeDir})
 
 	return cmd
 }
 
-func execCommand(cmdArgs []string, env []string) error {
+func execCommand(cmdArgs []string, env []string, verbose bool) error {
 	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
-	cmd.Env = append(os.Environ(), env...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+
+	setupCmdEnv(cmd, verbose, env)
 
 	err := cmd.Start()
 	if err != nil {
