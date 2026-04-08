@@ -1,7 +1,10 @@
 module github.com/ttab/ttrun
 
-go 1.24.0
+go 1.25.0
 
-require golang.org/x/term v0.40.0
+require (
+	golang.org/x/term v0.41.0
+	gopkg.in/yaml.v3 v3.0.1
+)
 
-require golang.org/x/sys v0.41.0 // indirect
+require golang.org/x/sys v0.42.0 // indirect
