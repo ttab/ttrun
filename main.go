@@ -217,6 +217,7 @@ func storeDir() string {
 type flags struct {
 	Help    bool
 	Verbose bool
+	Debug   bool
 	Profile string
 }
 
@@ -236,6 +237,7 @@ Usage:
 Options:
   -h, --help              Show this help message
   -v, --verbose           Print subprocess commands and show their stderr
+  -d, --debug             Print resolved environment variables and exit
   -p, --profile <name>    Use a named profile for config overrides and variables
 
 The env file (default: ttrun.env) contains KEY=VALUE lines where values
@@ -289,6 +291,12 @@ func parseFlags(args []string) (flags, []string) {
 
 			if arg == "-v" || arg == "--verbose" {
 				f.Verbose = true
+
+				continue
+			}
+
+			if arg == "-d" || arg == "--debug" {
+				f.Debug = true
 
 				continue
 			}
@@ -375,9 +383,21 @@ func run() error {
 		return runPull(args[1:], f.Verbose, f.Profile)
 	}
 
-	envFile, cmdArgs, err := parseArgs(args)
-	if err != nil {
-		return err
+	var envFile string
+	var cmdArgs []string
+
+	if f.Debug {
+		envFile = "ttrun.env"
+		if len(args) > 0 {
+			envFile = args[0]
+		}
+	} else {
+		var err error
+
+		envFile, cmdArgs, err = parseArgs(args)
+		if err != nil {
+			return err
+		}
 	}
 
 	ef, err := parseEnvFile(envFile)
@@ -410,6 +430,14 @@ func run() error {
 	resolved, err := resolveSecrets(entries, resolver)
 	if err != nil {
 		return err
+	}
+
+	if f.Debug {
+		for _, kv := range resolved {
+			fmt.Println(kv)
+		}
+
+		return nil
 	}
 
 	return execCommand(cmdArgs, resolved, f.Verbose)
@@ -904,6 +932,8 @@ type resolver struct {
 	passDir        string
 	cfg            config
 	vaultCache     map[string]map[string]string
+	vaultToken     string
+	vaultTokenOnce bool
 	nonInteractive bool
 	verbose        bool
 }
@@ -915,6 +945,15 @@ func newResolver(passDir string, cfg config, verbose bool) *resolver {
 		vaultCache: make(map[string]map[string]string),
 		verbose:    verbose,
 	}
+}
+
+func (r *resolver) getVaultToken(addr string) string {
+	if !r.vaultTokenOnce {
+		r.vaultToken = resolveVaultToken(addr, r.verbose)
+		r.vaultTokenOnce = true
+	}
+
+	return r.vaultToken
 }
 
 func (r *resolver) resolve(ref string) (string, error) {
@@ -1023,7 +1062,9 @@ func (r *resolver) resolveVault(ref string) (string, error) {
 
 	fields, ok := r.vaultCache[cacheKey]
 	if !ok {
-		fields, err = vaultGet(v.mount, v.path, addr, r.verbose)
+		token := r.getVaultToken(addr)
+
+		fields, err = vaultGet(v.mount, v.path, addr, token, r.verbose)
 		if err != nil {
 			return "", err
 		}
@@ -1157,8 +1198,10 @@ func runPull(args []string, verbose bool, profileName string) error {
 
 	var totalFields int
 
+	token := r.getVaultToken(addr)
+
 	for pk := range groups {
-		fields, err := vaultGet(pk.mount, pk.path, addr, verbose)
+		fields, err := vaultGet(pk.mount, pk.path, addr, token, verbose)
 		if err != nil {
 			return err
 		}
@@ -1183,12 +1226,84 @@ func runPull(args []string, verbose bool, profileName string) error {
 	return nil
 }
 
-func vaultGet(mount, path, addr string, verbose bool) (map[string]string, error) {
+// parseTokenHelper extracts the token_helper value from a Vault config file.
+func parseTokenHelper(content string) string {
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "token_helper") {
+			_, value, ok := strings.Cut(line, "=")
+			if ok {
+				value = strings.TrimSpace(value)
+				value = strings.Trim(value, `"'`)
+
+				return value
+			}
+		}
+	}
+
+	return ""
+}
+
+// tokenFromHelper reads the token_helper path from ~/.vault, then executes
+// it with VAULT_ADDR set and "get" as a subcommand.
+func tokenFromHelper(addr string, verbose bool) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("get home directory: %w", err)
+	}
+
+	configPath := filepath.Join(home, ".vault")
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", configPath, err)
+	}
+
+	helperPath := parseTokenHelper(string(data))
+	if helperPath == "" {
+		return "", fmt.Errorf("no token_helper found in %s", configPath)
+	}
+
+	cmd := exec.Command(helperPath, "get")
+
+	setupCmdEnv(cmd, verbose, []string{"VAULT_ADDR=" + addr})
+
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("run token helper %s: %w", helperPath, err)
+	}
+
+	token := strings.TrimSpace(string(out))
+	if token == "" {
+		return "", fmt.Errorf("token helper returned empty token for %s", addr)
+	}
+
+	return token, nil
+}
+
+// resolveVaultToken attempts to get a Vault token, first trying the token
+// helper configured in ~/.vault, then falling back to VAULT_TOKEN.
+func resolveVaultToken(addr string, verbose bool) string {
+	token, err := tokenFromHelper(addr, verbose)
+	if err == nil && token != "" {
+		return token
+	}
+
+	return os.Getenv("VAULT_TOKEN")
+}
+
+func vaultGet(mount, path, addr, token string, verbose bool) (map[string]string, error) {
 	args := []string{"kv", "get", "-mount=" + mount, "-format=json", path}
 
 	cmd := exec.Command("vault", args...)
 
-	setupCmdEnv(cmd, verbose, []string{"VAULT_ADDR=" + addr})
+	env := []string{"VAULT_ADDR=" + addr}
+	if token != "" {
+		env = append(env, "VAULT_TOKEN="+token)
+	}
+
+	setupCmdEnv(cmd, verbose, env)
 
 	out, err := cmd.Output()
 	if err != nil {

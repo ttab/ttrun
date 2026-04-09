@@ -13,6 +13,7 @@ func TestParseFlags(t *testing.T) {
 		wantArgs    []string
 		wantHelp    bool
 		wantVerbose bool
+		wantDebug   bool
 		wantProfile string
 	}{
 		{
@@ -116,6 +117,23 @@ func TestParseFlags(t *testing.T) {
 			args:     []string{"--", "cmd", "-p", "val"},
 			wantArgs: []string{"--", "cmd", "-p", "val"},
 		},
+		{
+			name:      "-d before separator",
+			args:      []string{"-d", "custom.env"},
+			wantArgs:  []string{"custom.env"},
+			wantDebug: true,
+		},
+		{
+			name:      "--debug before separator",
+			args:      []string{"--debug", "--", "echo"},
+			wantArgs:  []string{"--", "echo"},
+			wantDebug: true,
+		},
+		{
+			name:     "-d after separator kept",
+			args:     []string{"--", "cmd", "-d"},
+			wantArgs: []string{"--", "cmd", "-d"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -128,6 +146,10 @@ func TestParseFlags(t *testing.T) {
 
 			if f.Verbose != tt.wantVerbose {
 				t.Errorf("Verbose = %v, want %v", f.Verbose, tt.wantVerbose)
+			}
+
+			if f.Debug != tt.wantDebug {
+				t.Errorf("Debug = %v, want %v", f.Debug, tt.wantDebug)
 			}
 
 			if f.Profile != tt.wantProfile {
@@ -1083,4 +1105,52 @@ func TestPassPrefixMigration(t *testing.T) {
 			t.Error("vault:// ref should not trigger deprecated format error")
 		}
 	})
+}
+
+func TestParseTokenHelper(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{
+			name:    "double quoted",
+			content: `token_helper = "/usr/local/bin/vault-token-helper"`,
+			want:    "/usr/local/bin/vault-token-helper",
+		},
+		{
+			name:    "single quoted",
+			content: `token_helper = '/usr/local/bin/vault-token-helper'`,
+			want:    "/usr/local/bin/vault-token-helper",
+		},
+		{
+			name:    "unquoted",
+			content: `token_helper = /usr/local/bin/vault-token-helper`,
+			want:    "/usr/local/bin/vault-token-helper",
+		},
+		{
+			name:    "with other lines",
+			content: "# comment\ntoken_helper = \"/opt/helper\"\nother = value\n",
+			want:    "/opt/helper",
+		},
+		{
+			name:    "no helper",
+			content: "other = value\n",
+			want:    "",
+		},
+		{
+			name:    "empty",
+			content: "",
+			want:    "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseTokenHelper(tt.content)
+			if got != tt.want {
+				t.Errorf("parseTokenHelper() = %q, want %q", got, tt.want)
+			}
+		})
+	}
 }
