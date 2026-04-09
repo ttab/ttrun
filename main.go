@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"syscall"
 
 	"golang.org/x/term"
+	"gopkg.in/yaml.v3"
 )
 
 type config struct {
@@ -67,6 +69,139 @@ func saveConfig(cfg config) error {
 	return nil
 }
 
+type profile struct {
+	Config    profileConfig     `yaml:"config,omitempty"`
+	Variables map[string]string `yaml:"variables,omitempty"`
+}
+
+type profileConfig struct {
+	VaultAddr string `yaml:"vault_addr,omitempty"`
+	Cache     *bool  `yaml:"cache,omitempty"`
+}
+
+func profilesPath() string {
+	dir := os.Getenv("XDG_CONFIG_HOME")
+	if dir == "" {
+		dir = filepath.Join(os.Getenv("HOME"), ".config")
+	}
+
+	return filepath.Join(dir, "ttrun", "profiles.yaml")
+}
+
+func loadProfiles() (map[string]profile, error) {
+	data, err := os.ReadFile(profilesPath())
+	if errors.Is(err, os.ErrNotExist) {
+		return make(map[string]profile), nil
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("read profiles: %w", err)
+	}
+
+	var profiles map[string]profile
+
+	err = yaml.Unmarshal(data, &profiles)
+	if err != nil {
+		return nil, fmt.Errorf("parse profiles: %w", err)
+	}
+
+	if profiles == nil {
+		profiles = make(map[string]profile)
+	}
+
+	return profiles, nil
+}
+
+func saveProfiles(profiles map[string]profile) error {
+	data, err := yaml.Marshal(profiles)
+	if err != nil {
+		return fmt.Errorf("marshal profiles: %w", err)
+	}
+
+	dir := filepath.Dir(profilesPath())
+
+	err = os.MkdirAll(dir, 0o755)
+	if err != nil {
+		return fmt.Errorf("create profiles directory: %w", err)
+	}
+
+	err = os.WriteFile(profilesPath(), data, 0o644)
+	if err != nil {
+		return fmt.Errorf("write profiles: %w", err)
+	}
+
+	return nil
+}
+
+func mergeProfileConfig(base config, p profile) config {
+	if p.Config.VaultAddr != "" {
+		base.DefaultVaultAddr = p.Config.VaultAddr
+	}
+
+	if p.Config.Cache != nil {
+		base.Cache = *p.Config.Cache
+	}
+
+	return base
+}
+
+// resolveProfile determines the active profile from CLI flag, TTRUN_PROFILE
+// env var, and front matter (in that priority order). It warns when an
+// external source overrides the front matter profile.
+func resolveProfile(flagProfile, frontMatterProfile string) string {
+	envProfile := os.Getenv("TTRUN_PROFILE")
+
+	if flagProfile != "" {
+		if frontMatterProfile != "" && flagProfile != frontMatterProfile {
+			fmt.Fprintf(os.Stderr, "ttrun: warning: --profile %q overrides env file profile %q\n",
+				flagProfile, frontMatterProfile)
+		}
+
+		return flagProfile
+	}
+
+	if envProfile != "" {
+		if frontMatterProfile != "" && envProfile != frontMatterProfile {
+			fmt.Fprintf(os.Stderr, "ttrun: warning: TTRUN_PROFILE=%q overrides env file profile %q\n",
+				envProfile, frontMatterProfile)
+		}
+
+		return envProfile
+	}
+
+	return frontMatterProfile
+}
+
+func loadEffectiveConfig(profileName string) (config, map[string]string, error) {
+	cfg, err := loadConfig()
+	if err != nil {
+		return config{}, nil, err
+	}
+
+	if profileName == "" {
+		return cfg, nil, nil
+	}
+
+	profiles, err := loadProfiles()
+	if err != nil {
+		return config{}, nil, err
+	}
+
+	p, ok := profiles[profileName]
+	if !ok {
+		return config{}, nil, fmt.Errorf("unknown profile %q", profileName)
+	}
+
+	cfg = mergeProfileConfig(cfg, p)
+
+	vars := p.Variables
+	if vars == nil {
+		vars = make(map[string]string)
+	}
+
+	return cfg, vars, nil
+}
+
 func main() {
 	err := run()
 	if err != nil {
@@ -82,44 +217,54 @@ func storeDir() string {
 type flags struct {
 	Help    bool
 	Verbose bool
+	Debug   bool
+	Profile string
 }
 
 const usageText = `ttrun - run commands with secrets from pass and Vault
 
 Usage:
-  ttrun [envfile] -- command [args...]
+  ttrun [options] [envfile] -- command [args...]
   ttrun set <secret-path>
   ttrun get <secret-path>
   ttrun ls [subfolder]
   ttrun pull [envfile]
   ttrun configure <key> <value>
+  ttrun profile set <name> <key> <value>
   ttrun direnv [envfile]
   ttrun direnv hook
 
 Options:
-  -h, --help       Show this help message
-  -v, --verbose    Print subprocess commands and show their stderr
+  -h, --help              Show this help message
+  -v, --verbose           Print subprocess commands and show their stderr
+  -d, --debug             Print resolved environment variables and exit
+  -p, --profile <name>    Use a named profile for config overrides and variables
 
 The env file (default: ttrun.env) contains KEY=VALUE lines where values
-may reference secrets using {{path/to/secret}} for pass or
-{{vault://mount/path.field}} for Vault.
+may reference secrets using {{pass://path/to/secret}} for pass or
+{{vault://mount/path.field}} for Vault. Variables can be referenced with
+${name} and are resolved from the active profile before secret interpolation.
 
 Commands:
-  set          Interactively store a secret in the local pass store
-  get          Print a secret from the local pass store
-  ls           List secrets in the local pass store
-  pull         Pre-fetch and cache all vault secrets from the env file
-  configure    Set a configuration value (e.g. default-vault-addr)
-  direnv       Print export statements for use with direnv
-  direnv hook  Print a direnv hook that enables use_ttrun
+  set              Interactively store a secret in the local pass store
+  get              Print a secret from the local pass store
+  ls               List secrets in the local pass store
+  pull             Pre-fetch and cache all vault secrets from the env file
+  configure        Set a configuration value (e.g. default-vault-addr)
+  profile set      Set a variable in a named profile
+  direnv           Print export statements for use with direnv
+  direnv hook      Print a direnv hook that enables use_ttrun
 
 Configuration keys:
   default-vault-addr   Default Vault server address (used when VAULT_ADDR is not set)
   cache                Enable persistent caching of vault secrets (true/false)
+
+Environment variables:
+  TTRUN_PROFILE        Default profile (overridden by --profile, overrides env file front matter)
 `
 
-// parseFlags extracts global flags (-h, --help, -v, --verbose) from args
-// before the -- separator and returns the parsed flags and remaining args.
+// parseFlags extracts global flags (-h, --help, -v, --verbose, -p, --profile)
+// from args before the -- separator and returns the parsed flags and remaining args.
 func parseFlags(args []string) (flags, []string) {
 	var f flags
 
@@ -127,7 +272,9 @@ func parseFlags(args []string) (flags, []string) {
 
 	pastSep := false
 
-	for _, arg := range args {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+
 		if arg == "--" {
 			pastSep = true
 			filtered = append(filtered, arg)
@@ -136,13 +283,41 @@ func parseFlags(args []string) (flags, []string) {
 		}
 
 		if !pastSep {
-			switch arg {
-			case "-h", "--help":
+			if arg == "-h" || arg == "--help" {
 				f.Help = true
 
 				continue
-			case "-v", "--verbose":
+			}
+
+			if arg == "-v" || arg == "--verbose" {
 				f.Verbose = true
+
+				continue
+			}
+
+			if arg == "-d" || arg == "--debug" {
+				f.Debug = true
+
+				continue
+			}
+
+			if arg == "--profile" || arg == "-p" {
+				i++
+				if i < len(args) {
+					f.Profile = args[i]
+				}
+
+				continue
+			}
+
+			if strings.HasPrefix(arg, "--profile=") {
+				f.Profile = strings.TrimPrefix(arg, "--profile=")
+
+				continue
+			}
+
+			if strings.HasPrefix(arg, "-p=") {
+				f.Profile = strings.TrimPrefix(arg, "-p=")
 
 				continue
 			}
@@ -185,11 +360,15 @@ func run() error {
 	}
 
 	if len(args) >= 1 && args[0] == "configure" {
-		return runConfigure(args[1:])
+		return runConfigure(args[1:], f.Profile)
+	}
+
+	if len(args) >= 1 && args[0] == "profile" {
+		return runProfile(args[1:])
 	}
 
 	if len(args) >= 1 && args[0] == "direnv" {
-		return runDirenv(args[1:], f.Verbose)
+		return runDirenv(args[1:], f.Verbose, f.Profile)
 	}
 
 	if len(args) >= 1 && args[0] == "ls" {
@@ -201,20 +380,37 @@ func run() error {
 	}
 
 	if len(args) >= 1 && args[0] == "pull" {
-		return runPull(args[1:], f.Verbose)
+		return runPull(args[1:], f.Verbose, f.Profile)
 	}
 
-	cfg, err := loadConfig()
+	var envFile string
+	var cmdArgs []string
+
+	if f.Debug {
+		envFile = "ttrun.env"
+		if len(args) > 0 {
+			envFile = args[0]
+		}
+	} else {
+		var err error
+
+		envFile, cmdArgs, err = parseArgs(args)
+		if err != nil {
+			return err
+		}
+	}
+
+	ef, err := parseEnvFile(envFile)
 	if err != nil {
 		return err
 	}
 
-	envFile, cmdArgs, err := parseArgs(args)
+	cfg, vars, err := loadEffectiveConfig(resolveProfile(f.Profile, ef.profile))
 	if err != nil {
 		return err
 	}
 
-	entries, err := parseEnvFile(envFile)
+	entries, err := substituteEntryVars(ef.entries, vars)
 	if err != nil {
 		return err
 	}
@@ -236,6 +432,14 @@ func run() error {
 		return err
 	}
 
+	if f.Debug {
+		for _, kv := range resolved {
+			fmt.Println(kv)
+		}
+
+		return nil
+	}
+
 	return execCommand(cmdArgs, resolved, f.Verbose)
 }
 
@@ -254,9 +458,13 @@ func runSet(args []string, verbose bool) error {
 	return setSecret(args[0], dir, verbose)
 }
 
-func runConfigure(args []string) error {
+func runConfigure(args []string, profileName string) error {
 	if len(args) != 2 {
 		return errors.New("usage: ttrun configure <key> <value>")
+	}
+
+	if profileName != "" {
+		return configureProfile(profileName, args[0], args[1])
 	}
 
 	cfg, err := loadConfig()
@@ -281,6 +489,64 @@ func runConfigure(args []string) error {
 	}
 
 	return saveConfig(cfg)
+}
+
+func configureProfile(profileName, key, value string) error {
+	profiles, err := loadProfiles()
+	if err != nil {
+		return err
+	}
+
+	p := profiles[profileName]
+
+	switch key {
+	case "default-vault-addr":
+		p.Config.VaultAddr = value
+	case "cache":
+		switch value {
+		case "true":
+			v := true
+			p.Config.Cache = &v
+		case "false":
+			v := false
+			p.Config.Cache = &v
+		default:
+			return fmt.Errorf("cache value must be %q or %q, got %q", "true", "false", value)
+		}
+	default:
+		return fmt.Errorf("unknown configuration key: %q", key)
+	}
+
+	profiles[profileName] = p
+
+	return saveProfiles(profiles)
+}
+
+func runProfile(args []string) error {
+	if len(args) < 1 || args[0] != "set" {
+		return errors.New("usage: ttrun profile set <name> <key> <value>")
+	}
+
+	if len(args) != 4 {
+		return errors.New("usage: ttrun profile set <name> <key> <value>")
+	}
+
+	name, key, value := args[1], args[2], args[3]
+
+	profiles, err := loadProfiles()
+	if err != nil {
+		return err
+	}
+
+	p := profiles[name]
+	if p.Variables == nil {
+		p.Variables = make(map[string]string)
+	}
+
+	p.Variables[key] = value
+	profiles[name] = p
+
+	return saveProfiles(profiles)
 }
 
 func runLs(args []string, verbose bool) error {
@@ -324,7 +590,7 @@ func runGet(args []string, verbose bool) error {
 	return nil
 }
 
-func runDirenv(args []string, verbose bool) error {
+func runDirenv(args []string, verbose bool, profileName string) error {
 	if len(args) > 0 && args[0] == "hook" {
 		return runDirenvHook()
 	}
@@ -337,12 +603,17 @@ func runDirenv(args []string, verbose bool) error {
 		return errors.New("usage: ttrun direnv [envfile]")
 	}
 
-	cfg, err := loadConfig()
+	ef, err := parseEnvFile(envFile)
 	if err != nil {
 		return err
 	}
 
-	entries, err := parseEnvFile(envFile)
+	cfg, vars, err := loadEffectiveConfig(resolveProfile(profileName, ef.profile))
+	if err != nil {
+		return err
+	}
+
+	entries, err := substituteEntryVars(ef.entries, vars)
 	if err != nil {
 		return err
 	}
@@ -411,7 +682,7 @@ func hasPassRefs(entries []envEntry) bool {
 			ref := rest[:j]
 			rest = rest[j+2:]
 
-			if !strings.HasPrefix(ref, "vault://") {
+			if strings.HasPrefix(ref, "pass://") {
 				return true
 			}
 		}
@@ -460,23 +731,47 @@ func parseArgs(args []string) (envFile string, cmdArgs []string, err error) {
 	return envFile, after, nil
 }
 
-func parseEnvFile(path string) (entries []envEntry, retErr error) {
-	f, err := os.Open(path)
+type envFileResult struct {
+	entries []envEntry
+	profile string
+}
+
+func parseEnvFile(path string) (envFileResult, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("open env file: %w", err)
+		return envFileResult{}, fmt.Errorf("open env file: %w", err)
 	}
 
-	defer func() {
-		err := f.Close()
-		if err != nil && retErr == nil {
-			retErr = fmt.Errorf("close env file: %w", err)
+	lines := strings.Split(string(data), "\n")
+
+	var result envFileResult
+
+	bodyStart := 0
+
+	// Check for front matter: YAML lines before a --- separator.
+	for i, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if line == "---" {
+			fmContent := strings.Join(lines[:i], "\n")
+
+			var fm struct {
+				Profile string `yaml:"profile"`
+			}
+
+			err := yaml.Unmarshal([]byte(fmContent), &fm)
+			if err != nil {
+				return envFileResult{}, fmt.Errorf("parse front matter: %w", err)
+			}
+
+			result.profile = fm.Profile
+			bodyStart = i + 1
+
+			break
 		}
-	}()
+	}
 
-	scanner := bufio.NewScanner(f)
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+	for _, raw := range lines[bodyStart:] {
+		line := strings.TrimSpace(raw)
 
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
@@ -484,18 +779,13 @@ func parseEnvFile(path string) (entries []envEntry, retErr error) {
 
 		key, value, ok := strings.Cut(line, "=")
 		if !ok {
-			return nil, fmt.Errorf("malformed line (no '='): %q", line)
+			return envFileResult{}, fmt.Errorf("malformed line (no '='): %q", line)
 		}
 
-		entries = append(entries, envEntry{key: key, value: value})
+		result.entries = append(result.entries, envEntry{key: key, value: value})
 	}
 
-	err = scanner.Err()
-	if err != nil {
-		return nil, fmt.Errorf("read env file: %w", err)
-	}
-
-	return entries, nil
+	return result, nil
 }
 
 func interpolate(value string, resolve func(string) (string, error)) (string, error) {
@@ -534,6 +824,110 @@ func interpolate(value string, resolve func(string) (string, error)) (string, er
 	return result.String(), nil
 }
 
+// findVarClose returns the index of the closing } for a ${...} expression.
+// It handles quoted defaults like ${name:"value with } and \""}.
+// s starts after the ${ opening.
+func findVarClose(s string) int {
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '}':
+			return i
+		case ':':
+			if i+1 < len(s) && s[i+1] == '"' {
+				for j := i + 2; j < len(s); j++ {
+					if s[j] == '\\' && j+1 < len(s) {
+						j++
+
+						continue
+					}
+
+					if s[j] == '"' {
+						if j+1 < len(s) && s[j+1] == '}' {
+							return j + 1
+						}
+
+						return -1
+					}
+				}
+
+				return -1
+			}
+		}
+	}
+
+	return -1
+}
+
+func unquoteDefault(s string) string {
+	if len(s) < 2 || s[0] != '"' {
+		return s
+	}
+
+	unquoted, err := strconv.Unquote(s)
+	if err != nil {
+		return s
+	}
+
+	return unquoted
+}
+
+func substituteVars(value string, vars map[string]string) (string, error) {
+	var result strings.Builder
+
+	rest := value
+
+	for {
+		idx := strings.Index(rest, "${")
+		if idx == -1 {
+			result.WriteString(rest)
+
+			break
+		}
+
+		result.WriteString(rest[:idx])
+
+		rest = rest[idx+2:]
+
+		closeIdx := findVarClose(rest)
+		if closeIdx == -1 {
+			return "", fmt.Errorf("unclosed '${' in value: %q", value)
+		}
+
+		expr := rest[:closeIdx]
+		rest = rest[closeIdx+1:]
+
+		name, defaultVal, hasDefault := strings.Cut(expr, ":")
+
+		val, ok := vars[name]
+		if !ok {
+			if !hasDefault {
+				return "", fmt.Errorf("undefined variable ${%s}", name)
+			}
+
+			val = unquoteDefault(defaultVal)
+		}
+
+		result.WriteString(val)
+	}
+
+	return result.String(), nil
+}
+
+func substituteEntryVars(entries []envEntry, vars map[string]string) ([]envEntry, error) {
+	result := make([]envEntry, len(entries))
+
+	for i, e := range entries {
+		val, err := substituteVars(e.value, vars)
+		if err != nil {
+			return nil, fmt.Errorf("substitute %s: %w", e.key, err)
+		}
+
+		result[i] = envEntry{key: e.key, value: val}
+	}
+
+	return result, nil
+}
+
 type resolver struct {
 	passDir        string
 	cfg            config
@@ -556,16 +950,22 @@ func (r *resolver) resolve(ref string) (string, error) {
 		return r.resolveVault(ref)
 	}
 
+	if !strings.HasPrefix(ref, "pass://") {
+		return "", fmt.Errorf("secret reference %q uses deprecated format; update to {{pass://%s}}", ref, ref)
+	}
+
+	path := strings.TrimPrefix(ref, "pass://")
+
 	if r.nonInteractive {
-		secret, err := passShow(r.passDir, ref, r.verbose)
+		secret, err := passShow(r.passDir, path, r.verbose)
 		if err != nil {
-			return "", fmt.Errorf("secret %q not found in store", ref)
+			return "", fmt.Errorf("secret %q not found in store", path)
 		}
 
 		return secret, nil
 	}
 
-	return getOrCreateSecret(ref, r.passDir, r.verbose)
+	return getOrCreateSecret(path, r.passDir, r.verbose)
 }
 
 type vaultRef struct {
@@ -721,7 +1121,7 @@ func collectVaultRefs(entries []envEntry) []string {
 	return refs
 }
 
-func runPull(args []string, verbose bool) error {
+func runPull(args []string, verbose bool, profileName string) error {
 	envFile := "ttrun.env"
 
 	if len(args) == 1 {
@@ -730,12 +1130,17 @@ func runPull(args []string, verbose bool) error {
 		return errors.New("usage: ttrun pull [envfile]")
 	}
 
-	cfg, err := loadConfig()
+	ef, err := parseEnvFile(envFile)
 	if err != nil {
 		return err
 	}
 
-	entries, err := parseEnvFile(envFile)
+	cfg, vars, err := loadEffectiveConfig(resolveProfile(profileName, ef.profile))
+	if err != nil {
+		return err
+	}
+
+	entries, err := substituteEntryVars(ef.entries, vars)
 	if err != nil {
 		return err
 	}

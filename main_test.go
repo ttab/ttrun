@@ -13,6 +13,8 @@ func TestParseFlags(t *testing.T) {
 		wantArgs    []string
 		wantHelp    bool
 		wantVerbose bool
+		wantDebug   bool
+		wantProfile string
 	}{
 		{
 			name:     "no flags",
@@ -79,6 +81,59 @@ func TestParseFlags(t *testing.T) {
 			name: "no args",
 			args: []string{},
 		},
+		{
+			name:        "--profile=name",
+			args:        []string{"--profile=staging", "--", "echo"},
+			wantArgs:    []string{"--", "echo"},
+			wantProfile: "staging",
+		},
+		{
+			name:        "--profile name",
+			args:        []string{"--profile", "staging", "--", "echo"},
+			wantArgs:    []string{"--", "echo"},
+			wantProfile: "staging",
+		},
+		{
+			name:        "-p=name",
+			args:        []string{"-p=staging", "--", "echo"},
+			wantArgs:    []string{"--", "echo"},
+			wantProfile: "staging",
+		},
+		{
+			name:        "-p name",
+			args:        []string{"-p", "staging", "--", "echo"},
+			wantArgs:    []string{"--", "echo"},
+			wantProfile: "staging",
+		},
+		{
+			name:        "-p with other flags",
+			args:        []string{"-v", "-p", "prod", "--", "echo"},
+			wantArgs:    []string{"--", "echo"},
+			wantVerbose: true,
+			wantProfile: "prod",
+		},
+		{
+			name:     "-p after separator kept",
+			args:     []string{"--", "cmd", "-p", "val"},
+			wantArgs: []string{"--", "cmd", "-p", "val"},
+		},
+		{
+			name:      "-d before separator",
+			args:      []string{"-d", "custom.env"},
+			wantArgs:  []string{"custom.env"},
+			wantDebug: true,
+		},
+		{
+			name:      "--debug before separator",
+			args:      []string{"--debug", "--", "echo"},
+			wantArgs:  []string{"--", "echo"},
+			wantDebug: true,
+		},
+		{
+			name:     "-d after separator kept",
+			args:     []string{"--", "cmd", "-d"},
+			wantArgs: []string{"--", "cmd", "-d"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -91,6 +146,14 @@ func TestParseFlags(t *testing.T) {
 
 			if f.Verbose != tt.wantVerbose {
 				t.Errorf("Verbose = %v, want %v", f.Verbose, tt.wantVerbose)
+			}
+
+			if f.Debug != tt.wantDebug {
+				t.Errorf("Debug = %v, want %v", f.Debug, tt.wantDebug)
+			}
+
+			if f.Profile != tt.wantProfile {
+				t.Errorf("Profile = %q, want %q", f.Profile, tt.wantProfile)
 			}
 
 			if len(got) != len(tt.wantArgs) {
@@ -182,10 +245,11 @@ func TestParseArgs(t *testing.T) {
 
 func TestParseEnvFile(t *testing.T) {
 	tests := []struct {
-		name    string
-		content string
-		want    []envEntry
-		wantErr bool
+		name        string
+		content     string
+		want        []envEntry
+		wantProfile string
+		wantErr     bool
 	}{
 		{
 			name:    "normal lines",
@@ -226,6 +290,34 @@ func TestParseEnvFile(t *testing.T) {
 			content: "",
 			want:    nil,
 		},
+		{
+			name:        "front matter with profile",
+			content:     "profile: staging\n---\nFOO=bar\n",
+			wantProfile: "staging",
+			want: []envEntry{
+				{key: "FOO", value: "bar"},
+			},
+		},
+		{
+			name:    "front matter with no profile",
+			content: "other: value\n---\nFOO=bar\n",
+			want: []envEntry{
+				{key: "FOO", value: "bar"},
+			},
+		},
+		{
+			name:        "front matter only",
+			content:     "profile: prod\n---\n",
+			wantProfile: "prod",
+			want:        nil,
+		},
+		{
+			name:    "no front matter separator",
+			content: "FOO=bar\n",
+			want: []envEntry{
+				{key: "FOO", value: "bar"},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -251,13 +343,17 @@ func TestParseEnvFile(t *testing.T) {
 				t.Fatalf("unexpected error: %v", err)
 			}
 
-			if len(got) != len(tt.want) {
-				t.Fatalf("got %d entries, want %d", len(got), len(tt.want))
+			if got.profile != tt.wantProfile {
+				t.Errorf("profile = %q, want %q", got.profile, tt.wantProfile)
 			}
 
-			for i := range got {
-				if got[i] != tt.want[i] {
-					t.Errorf("entry[%d] = %+v, want %+v", i, got[i], tt.want[i])
+			if len(got.entries) != len(tt.want) {
+				t.Fatalf("got %d entries, want %d", len(got.entries), len(tt.want))
+			}
+
+			for i := range got.entries {
+				if got.entries[i] != tt.want[i] {
+					t.Errorf("entry[%d] = %+v, want %+v", i, got.entries[i], tt.want[i])
 				}
 			}
 		})
@@ -387,7 +483,7 @@ func TestHasPassRefs(t *testing.T) {
 		},
 		{
 			name:    "pass ref",
-			entries: []envEntry{{key: "A", value: "{{secret/path}}"}},
+			entries: []envEntry{{key: "A", value: "{{pass://secret/path}}"}},
 			want:    true,
 		},
 		{
@@ -399,9 +495,14 @@ func TestHasPassRefs(t *testing.T) {
 			name: "mixed refs",
 			entries: []envEntry{
 				{key: "A", value: "{{vault://mount/path.field}}"},
-				{key: "B", value: "{{secret/path}}"},
+				{key: "B", value: "{{pass://secret/path}}"},
 			},
 			want: true,
+		},
+		{
+			name:    "bare path not detected as pass",
+			entries: []envEntry{{key: "A", value: "{{secret/path}}"}},
+			want:    false,
 		},
 	}
 
@@ -602,7 +703,7 @@ func TestCollectVaultRefs(t *testing.T) {
 		},
 		{
 			name:    "pass ref only",
-			entries: []envEntry{{key: "A", value: "{{secret/path}}"}},
+			entries: []envEntry{{key: "A", value: "{{pass://secret/path}}"}},
 			want:    nil,
 		},
 		{
@@ -631,7 +732,7 @@ func TestCollectVaultRefs(t *testing.T) {
 		{
 			name: "mixed refs",
 			entries: []envEntry{
-				{key: "A", value: "{{secret/pass}}"},
+				{key: "A", value: "{{pass://secret/pass}}"},
 				{key: "B", value: "{{vault://m/p.f}}"},
 				{key: "C", value: "prefix-{{vault://m2/p2.f2}}-suffix"},
 			},
@@ -654,4 +755,354 @@ func TestCollectVaultRefs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSubstituteVars(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		vars    map[string]string
+		want    string
+		wantErr bool
+	}{
+		{
+			name:  "no variables",
+			value: "plain-value",
+			vars:  map[string]string{"foo": "bar"},
+			want:  "plain-value",
+		},
+		{
+			name:  "single variable",
+			value: "${env}",
+			vars:  map[string]string{"env": "staging"},
+			want:  "staging",
+		},
+		{
+			name:  "variable with surrounding text",
+			value: "prefix-${env}-suffix",
+			vars:  map[string]string{"env": "prod"},
+			want:  "prefix-prod-suffix",
+		},
+		{
+			name:  "multiple variables",
+			value: "${a}-${b}",
+			vars:  map[string]string{"a": "x", "b": "y"},
+			want:  "x-y",
+		},
+		{
+			name:    "undefined variable",
+			value:   "${missing}",
+			vars:    map[string]string{},
+			wantErr: true,
+		},
+		{
+			name:    "unclosed variable",
+			value:   "${unclosed",
+			vars:    map[string]string{},
+			wantErr: true,
+		},
+		{
+			name:  "empty vars no placeholders",
+			value: "plain",
+			vars:  map[string]string{},
+			want:  "plain",
+		},
+		{
+			name:  "variable inside template ref",
+			value: "{{pass://${env}/secret}}",
+			vars:  map[string]string{"env": "staging"},
+			want:  "{{pass://staging/secret}}",
+		},
+		{
+			name:  "literal single dollar",
+			value: "$notavar",
+			vars:  map[string]string{},
+			want:  "$notavar",
+		},
+		{
+			name:  "default used when undefined",
+			value: "${missing:fallback}",
+			vars:  map[string]string{},
+			want:  "fallback",
+		},
+		{
+			name:  "default ignored when defined",
+			value: "${env:fallback}",
+			vars:  map[string]string{"env": "staging"},
+			want:  "staging",
+		},
+		{
+			name:  "empty default",
+			value: "${missing:}",
+			vars:  map[string]string{},
+			want:  "",
+		},
+		{
+			name:  "quoted default",
+			value: `${missing:"hello world"}`,
+			vars:  map[string]string{},
+			want:  "hello world",
+		},
+		{
+			name:  "quoted default with escaped quotes",
+			value: `${missing:"This \"should\" be enough {}"}`,
+			vars:  map[string]string{},
+			want:  `This "should" be enough {}`,
+		},
+		{
+			name:  "quoted default with braces",
+			value: `${missing:"a}b"}`,
+			vars:  map[string]string{},
+			want:  "a}b",
+		},
+		{
+			name:  "numeric default",
+			value: "${count:0}",
+			vars:  map[string]string{},
+			want:  "0",
+		},
+		{
+			name:  "default with surrounding text",
+			value: "prefix-${missing:val}-suffix",
+			vars:  map[string]string{},
+			want:  "prefix-val-suffix",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := substituteVars(tt.value, tt.vars)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSubstituteEntryVars(t *testing.T) {
+	t.Run("nil vars errors on variable ref", func(t *testing.T) {
+		entries := []envEntry{{key: "A", value: "${foo}"}}
+
+		_, err := substituteEntryVars(entries, nil)
+		if err == nil {
+			t.Fatal("expected error for undefined variable with nil vars")
+		}
+	})
+
+	t.Run("nil vars passes through plain values", func(t *testing.T) {
+		entries := []envEntry{{key: "A", value: "plain"}}
+
+		got, err := substituteEntryVars(entries, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if got[0].value != "plain" {
+			t.Errorf("expected passthrough, got %q", got[0].value)
+		}
+	})
+
+	t.Run("substitutes with vars", func(t *testing.T) {
+		entries := []envEntry{
+			{key: "A", value: "${env}-value"},
+			{key: "B", value: "plain"},
+		}
+		vars := map[string]string{"env": "staging"}
+
+		got, err := substituteEntryVars(entries, vars)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if got[0].value != "staging-value" {
+			t.Errorf("got %q, want %q", got[0].value, "staging-value")
+		}
+
+		if got[1].value != "plain" {
+			t.Errorf("got %q, want %q", got[1].value, "plain")
+		}
+	})
+}
+
+func TestResolveProfile(t *testing.T) {
+	tests := []struct {
+		name         string
+		flagProfile  string
+		envProfile   string
+		fmProfile    string
+		want         string
+		wantWarning  bool
+	}{
+		{
+			name: "all empty",
+			want: "",
+		},
+		{
+			name:      "front matter only",
+			fmProfile: "staging",
+			want:      "staging",
+		},
+		{
+			name:       "env var only",
+			envProfile: "prod",
+			want:       "prod",
+		},
+		{
+			name:        "flag only",
+			flagProfile: "dev",
+			want:        "dev",
+		},
+		{
+			name:        "flag overrides env var",
+			flagProfile: "dev",
+			envProfile:  "prod",
+			want:        "dev",
+		},
+		{
+			name:        "flag overrides front matter",
+			flagProfile: "dev",
+			fmProfile:   "staging",
+			want:        "dev",
+			wantWarning: true,
+		},
+		{
+			name:        "env var overrides front matter",
+			envProfile:  "prod",
+			fmProfile:   "staging",
+			want:        "prod",
+			wantWarning: true,
+		},
+		{
+			name:        "flag overrides both",
+			flagProfile: "dev",
+			envProfile:  "prod",
+			fmProfile:   "staging",
+			want:        "dev",
+			wantWarning: true,
+		},
+		{
+			name:       "same env var and front matter no warning",
+			envProfile: "staging",
+			fmProfile:  "staging",
+			want:       "staging",
+		},
+		{
+			name:        "same flag and front matter no warning",
+			flagProfile: "staging",
+			fmProfile:   "staging",
+			want:        "staging",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("TTRUN_PROFILE", tt.envProfile)
+
+			got := resolveProfile(tt.flagProfile, tt.fmProfile)
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMergeProfileConfig(t *testing.T) {
+	t.Run("override vault addr", func(t *testing.T) {
+		base := config{DefaultVaultAddr: "https://base.vault", Cache: false}
+		p := profile{Config: profileConfig{VaultAddr: "https://profile.vault"}}
+
+		got := mergeProfileConfig(base, p)
+
+		if got.DefaultVaultAddr != "https://profile.vault" {
+			t.Errorf("VaultAddr = %q, want %q", got.DefaultVaultAddr, "https://profile.vault")
+		}
+
+		if got.Cache != false {
+			t.Error("Cache should remain false")
+		}
+	})
+
+	t.Run("override cache", func(t *testing.T) {
+		base := config{DefaultVaultAddr: "https://base.vault", Cache: false}
+		v := true
+		p := profile{Config: profileConfig{Cache: &v}}
+
+		got := mergeProfileConfig(base, p)
+
+		if got.DefaultVaultAddr != "https://base.vault" {
+			t.Errorf("VaultAddr = %q, want %q", got.DefaultVaultAddr, "https://base.vault")
+		}
+
+		if got.Cache != true {
+			t.Error("Cache should be true")
+		}
+	})
+
+	t.Run("no overrides", func(t *testing.T) {
+		base := config{DefaultVaultAddr: "https://base.vault", Cache: true}
+		p := profile{}
+
+		got := mergeProfileConfig(base, p)
+
+		if got.DefaultVaultAddr != "https://base.vault" {
+			t.Errorf("VaultAddr = %q, want %q", got.DefaultVaultAddr, "https://base.vault")
+		}
+
+		if got.Cache != true {
+			t.Error("Cache should remain true")
+		}
+	})
+
+	t.Run("cache false override", func(t *testing.T) {
+		base := config{Cache: true}
+		v := false
+		p := profile{Config: profileConfig{Cache: &v}}
+
+		got := mergeProfileConfig(base, p)
+
+		if got.Cache != false {
+			t.Error("Cache should be false")
+		}
+	})
+}
+
+func TestPassPrefixMigration(t *testing.T) {
+	r := newResolver("/tmp/fake-store", config{}, false)
+
+	t.Run("bare path errors with guidance", func(t *testing.T) {
+		_, err := r.resolve("secret/path")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+
+		want := `secret reference "secret/path" uses deprecated format; update to {{pass://secret/path}}`
+		if err.Error() != want {
+			t.Errorf("got %q, want %q", err.Error(), want)
+		}
+	})
+
+	t.Run("vault prefix passes through", func(t *testing.T) {
+		// This will fail for other reasons (no vault), but should not
+		// trigger the deprecated format error.
+		_, err := r.resolve("vault://mount/path.field")
+		if err == nil {
+			return
+		}
+
+		if got := err.Error(); got == `secret reference "vault://mount/path.field" uses deprecated format; update to {{pass://vault://mount/path.field}}` {
+			t.Error("vault:// ref should not trigger deprecated format error")
+		}
+	})
 }
